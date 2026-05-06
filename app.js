@@ -69,6 +69,8 @@ const PAGE_SIZE = 9;
 let currentQuery = "classic";
 let currentPage = 1;
 let totalPages = 1;
+let activeSearchController = null;
+let activeSearchRequestId = 0;
 
 const prevPageBtn = document.getElementById("prevPageBtn");
 const nextPageBtn = document.getElementById("nextPageBtn");
@@ -97,7 +99,6 @@ function saveAuthSession(user) {
       expiresAt
     })
   );
-  // Keep a lightweight marker in sessionStorage for current tab/session use.
   sessionStorage.setItem(AUTH_SESSION_ACTIVE_KEY, "1");
 }
 
@@ -406,18 +407,43 @@ function renderBookSkeletons(count = PAGE_SIZE) {
 }
 
 async function searchBooks(query, page = 1) {
-  currentQuery = query;
+  const normalizedQuery = String(query || "").trim();
+  if (!normalizedQuery) {
+    // Cancel pending requests so stale results never overwrite empty-state UI.
+    if (activeSearchController) {
+      activeSearchController.abort();
+      activeSearchController = null;
+    }
+    activeSearchRequestId += 1;
+    currentQuery = "";
+    currentPage = 1;
+    totalPages = 1;
+    updatePaginationUI(1);
+    booksGrid.innerHTML =
+      '<p class="col-span-full rounded-lg border border-slate-800 bg-slate-900 p-4 text-slate-400">Type a title, author, or genre to start searching.</p>';
+    return;
+  }
+
+  currentQuery = normalizedQuery;
   currentPage = page;
+  const requestId = ++activeSearchRequestId;
+
+  if (activeSearchController) {
+    activeSearchController.abort();
+  }
+  activeSearchController = new AbortController();
 
   renderBookSkeletons();
   try {
     // Open Library tends to respond quickly and avoids Gutendex format requirements.
     const offset = (page - 1) * PAGE_SIZE;
     const response = await fetch(
-      `https://openlibrary.org/search.json?q=${encodeURIComponent(query)}&limit=${PAGE_SIZE}&offset=${offset}`
+      `https://openlibrary.org/search.json?q=${encodeURIComponent(normalizedQuery)}&limit=${PAGE_SIZE}&offset=${offset}`,
+      { signal: activeSearchController.signal }
     );
     if (!response.ok) throw new Error(`Open Library HTTP ${response.status}`);
     const data = await response.json();
+    if (requestId !== activeSearchRequestId) return;
 
     const docs = data.docs || [];
     const numFound = typeof data.numFound === "number" ? data.numFound : 0;
@@ -426,9 +452,14 @@ async function searchBooks(query, page = 1) {
 
     renderBooks(docs);
   } catch (error) {
+    if (error?.name === "AbortError") return;
     booksGrid.innerHTML =
       '<p class="col-span-full rounded-lg border border-rose-700 bg-rose-950/50 p-4 text-rose-300">Could not load books. Please try again.</p>';
     showToast(error.message || "Failed to load books", "error");
+  } finally {
+    if (requestId === activeSearchRequestId) {
+      activeSearchController = null;
+    }
   }
 }
 
@@ -511,7 +542,6 @@ logoutBtn.addEventListener("click", async () => {
 searchForm.addEventListener("submit", (event) => {
   event.preventDefault();
   const query = searchInput.value.trim();
-  if (!query) return;
   searchBooks(query, 1);
 });
 
