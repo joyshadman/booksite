@@ -1,8 +1,17 @@
 {
+  "scripts": {
+    "build:css": "npx @tailwindcss/cli -i ./src/tailwind.css -o ./style.css --minify",
+    "watch:css": "npx @tailwindcss/cli -i ./src/tailwind.css -o ./style.css --watch",
+    "build": "npm run build:css"
+  },
   "dependencies": {
     "firebase": "^12.12.1"
   },
   "devDependencies": {
-    "serve": "^14.2.6"
+    "@tailwindcss/cli": "^4.1.16",
+    "autoprefixer": "^10.5.0",
+    "postcss": "^8.5.14",
+    "serve": "^14.2.6",
+    "tailwindcss": "^4.2.4"
   }
 }

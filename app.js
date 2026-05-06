@@ -4,10 +4,12 @@ import {
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
   signOut,
-  onAuthStateChanged
+  onAuthStateChanged,
+  setPersistence,
+  browserLocalPersistence
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
-  getFirestore,
+  initializeFirestore,
   doc,
   setDoc,
   deleteDoc,
@@ -26,7 +28,10 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
-const db = getFirestore(app);
+const db = initializeFirestore(app, {
+  experimentalAutoDetectLongPolling: true,
+  useFetchStreams: false
+});
 
 // DOM Elements (must exist in index.html)
 const appSection = document.getElementById("appSection");
@@ -53,6 +58,12 @@ let currentUser = null;
 let favoritesMap = new Map();
 let latestBooks = [];
 let unsubscribeFavorites = null;
+let hasShownFavoritesPermissionError = false;
+let isSigningOutForExpiry = false;
+
+const AUTH_SESSION_KEY = "booknest_auth_session";
+const AUTH_SESSION_ACTIVE_KEY = "booknest_auth_active";
+const AUTH_TTL_DAYS = 7;
 
 const PAGE_SIZE = 9;
 let currentQuery = "classic";
@@ -69,11 +80,61 @@ if (window.location.protocol === "file:") {
   );
 }
 
-function showToast(message, isError = false) {
+setPersistence(auth, browserLocalPersistence).catch((error) => {
+  console.error("Auth persistence setup error:", error);
+});
+
+function saveAuthSession(user) {
+  if (!user) return;
+  const now = Date.now();
+  const expiresAt = now + AUTH_TTL_DAYS * 24 * 60 * 60 * 1000;
+  localStorage.setItem(
+    AUTH_SESSION_KEY,
+    JSON.stringify({
+      uid: user.uid,
+      email: user.email || "",
+      createdAt: now,
+      expiresAt
+    })
+  );
+  // Keep a lightweight marker in sessionStorage for current tab/session use.
+  sessionStorage.setItem(AUTH_SESSION_ACTIVE_KEY, "1");
+}
+
+function clearAuthSession() {
+  localStorage.removeItem(AUTH_SESSION_KEY);
+  sessionStorage.removeItem(AUTH_SESSION_ACTIVE_KEY);
+}
+
+function getStoredAuthSession() {
+  const raw = localStorage.getItem(AUTH_SESSION_KEY);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    clearAuthSession();
+    return null;
+  }
+}
+
+function isStoredSessionExpired(user) {
+  const session = getStoredAuthSession();
+  if (!session) return false;
+  if (session.uid !== user.uid) return true;
+  return Date.now() > Number(session.expiresAt || 0);
+}
+
+function showToast(message, type = "info") {
+  const normalizedType = typeof type === "boolean" ? (type ? "error" : "info") : type;
+  const toneClasses =
+    normalizedType === "success"
+      ? "border border-emerald-400/40 bg-emerald-500/85"
+      : normalizedType === "error"
+        ? "border border-rose-400/40 bg-rose-600/90"
+        : "border border-sky-300/40 bg-sky-500/85";
+
   toast.textContent = message;
-  toast.className = `fixed top-6 right-6 z-50 glass rounded-2xl px-6 py-3 text-sm font-medium text-white transition-all duration-300 ${
-    isError ? "bg-rose-600/90" : "bg-slate-800/90"
-  } hidden`;
+  toast.className = `fixed top-6 right-6 z-50 rounded-2xl px-6 py-3 text-sm font-medium text-white shadow-xl backdrop-blur-md transition-all duration-300 ${toneClasses} hidden`;
   toast.classList.remove("hidden");
   setTimeout(() => {
     toast.classList.add("hidden");
@@ -192,25 +253,27 @@ authFormContainer?.addEventListener("submit", async (e) => {
 
   try {
     if (mode === "signup") {
-      await createUserWithEmailAndPassword(auth, email, password);
-      showToast("Account created successfully!");
+      const credential = await createUserWithEmailAndPassword(auth, email, password);
+      saveAuthSession(credential.user);
+      showToast("Account created successfully!", "success");
     } else {
-      await signInWithEmailAndPassword(auth, email, password);
-      showToast("Welcome back!");
+      const credential = await signInWithEmailAndPassword(auth, email, password);
+      saveAuthSession(credential.user);
+      showToast("Welcome back!", "success");
     }
     window.toggleAuthModal();
   } catch (error) {
     console.error("Auth error:", error);
     showToast(
       `${error?.code ? error.code + ": " : ""}${error?.message || "Auth failed"}`,
-      true
+      "error"
     );
   }
 });
 
 function requireSignIn(message = "Please sign in first.") {
   if (currentUser) return true;
-  showToast(message, true);
+  showToast(message, "error");
   if (typeof window.toggleAuthModal === "function") {
     window.toggleAuthModal("login");
   }
@@ -322,12 +385,31 @@ function renderFavorites() {
     .join("");
 }
 
+function renderBookSkeletons(count = PAGE_SIZE) {
+  const skeletonCards = Array.from({ length: count }, (_, idx) => {
+    return `
+      <article class="skeleton-card overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
+        <div class="skeleton-shimmer aspect-[3/4] w-full rounded-xl bg-slate-800/80"></div>
+        <div class="mt-4 space-y-3">
+          <div class="skeleton-shimmer h-4 w-5/6 rounded-md bg-slate-800/80"></div>
+          <div class="skeleton-shimmer h-3 w-2/3 rounded-md bg-slate-800/70"></div>
+          <div class="mt-5 grid grid-cols-2 gap-2">
+            <div class="skeleton-shimmer h-9 rounded-xl bg-slate-800/70"></div>
+            <div class="skeleton-shimmer h-9 rounded-xl bg-slate-800/70"></div>
+          </div>
+        </div>
+      </article>
+    `;
+  }).join("");
+
+  booksGrid.innerHTML = skeletonCards;
+}
+
 async function searchBooks(query, page = 1) {
   currentQuery = query;
   currentPage = page;
 
-  booksGrid.innerHTML =
-    '<p class="col-span-full rounded-lg border border-slate-800 bg-slate-900 p-4 text-slate-400">Loading books...</p>';
+  renderBookSkeletons();
   try {
     // Open Library tends to respond quickly and avoids Gutendex format requirements.
     const offset = (page - 1) * PAGE_SIZE;
@@ -346,7 +428,7 @@ async function searchBooks(query, page = 1) {
   } catch (error) {
     booksGrid.innerHTML =
       '<p class="col-span-full rounded-lg border border-rose-700 bg-rose-950/50 p-4 text-rose-300">Could not load books. Please try again.</p>';
-    showToast(error.message || "Failed to load books", true);
+    showToast(error.message || "Failed to load books", "error");
   }
 }
 
@@ -366,10 +448,17 @@ function startFavoritesListener(uid) {
     (error) => {
       // Most common reason: Firestore security rules deny access.
       console.error("Favorites listener error:", error);
-      showToast(
-        `Favorites listener failed: ${error?.code ? error.code + ": " : ""}${error?.message || ""}`,
-        true
-      );
+      if (error?.code === "permission-denied") {
+        if (!hasShownFavoritesPermissionError) {
+          hasShownFavoritesPermissionError = true;
+          showToast(
+            "Favorites permission denied. Publish Firestore rules for users/{uid}/favorites.",
+            "error"
+          );
+        }
+        return;
+      }
+      showToast(`Favorites listener failed: ${error?.message || "unknown error"}`, "error");
     }
   );
 }
@@ -399,22 +488,23 @@ async function saveFavorite(bookId) {
   };
 
   await setDoc(userFavoritesDoc(bookId), payload);
-  showToast("Saved to favorites");
+  showToast("Saved to favorites", "success");
 }
 
 async function removeFavorite(bookId) {
   if (!currentUser) return;
   await deleteDoc(userFavoritesDoc(bookId));
-  showToast("Removed from favorites");
+  showToast("Removed from favorites", "error");
 }
 
 logoutBtn.addEventListener("click", async () => {
   try {
     await signOut(auth);
-    showToast("Logged out");
+    clearAuthSession();
+    showToast("Logged out", "info");
   } catch (error) {
     console.error("Logout error:", error);
-    showToast(`${error?.code ? error.code + ": " : ""}${error?.message || "Logout failed"}`, true);
+    showToast(`${error?.code ? error.code + ": " : ""}${error?.message || "Logout failed"}`, "error");
   }
 });
 
@@ -443,7 +533,7 @@ booksGrid.addEventListener("click", async (event) => {
     if (!requireSignIn("Please sign in to read books.")) return;
     const url = readButton.dataset.readUrl;
     if (!url) {
-      showToast("No readable format available for this book.", true);
+      showToast("No readable format available for this book.", "error");
       return;
     }
     window.open(url, "_blank", "noopener,noreferrer");
@@ -465,7 +555,7 @@ booksGrid.addEventListener("click", async (event) => {
     console.error("Favorite update error:", error);
     showToast(
       `${error?.code ? error.code + ": " : ""}${error?.message || "Favorite update failed"}`,
-      true
+      "error"
     );
   }
 });
@@ -479,14 +569,31 @@ favoritesGrid.addEventListener("click", async (event) => {
     console.error("Favorite removal error:", error);
     showToast(
       `${error?.code ? error.code + ": " : ""}${error?.message || "Favorite removal failed"}`,
-      true
+      "error"
     );
   }
 });
 
 onAuthStateChanged(auth, (user) => {
+  hasShownFavoritesPermissionError = false;
+
+  if (user && isStoredSessionExpired(user)) {
+    if (!isSigningOutForExpiry) {
+      isSigningOutForExpiry = true;
+      showToast("Session expired. Please sign in again.", "error");
+      signOut(auth).finally(() => {
+        isSigningOutForExpiry = false;
+      });
+    }
+    return;
+  }
+
   currentUser = user;
   if (user) {
+    saveAuthSession(user);
+    if (authModal && !authModal.classList.contains("hidden")) {
+      authModal.classList.add("hidden");
+    }
     loggedOutLinks?.classList.add("hidden");
     loggedInLinks?.classList.remove("hidden");
     logoutBtn?.classList.remove("hidden");
@@ -498,6 +605,7 @@ onAuthStateChanged(auth, (user) => {
     logoutBtn?.classList.add("hidden");
     userDisplay.textContent = "";
     stopFavoritesListener();
+    clearAuthSession();
   }
 });
 

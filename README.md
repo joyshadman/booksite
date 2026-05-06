@@ -10,7 +10,7 @@ This is a simple book website where users can:
 ## Tech Stack
 
 - HTML
-- Tailwind CSS (CDN)
+- Tailwind CSS (CLI build)
 - Vanilla JavaScript
 - Firebase Authentication + Firestore
 - Project Gutenberg (Gutendex API)
@@ -67,6 +67,23 @@ Because Firebase modules are imported with ES modules, run through a local serve
 - `npx serve .`
 
 Then open `index.html` in browser through that server URL.
+
+Before running, build Tailwind CSS once:
+
+- `npm install`
+- `npm run build:css`
+
+To keep CSS updated while editing classes:
+
+- `npm run watch:css`
+
+## 4) Publish Firestore Rules
+
+This repo includes `firestore.rules` and `firebase.json`. Deploy rules with:
+
+- `firebase login`
+- `firebase use library-de0d8`
+- `firebase deploy --only firestore:rules`
 
 ## Project Files
 
